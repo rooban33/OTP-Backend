@@ -49,16 +49,14 @@ class SecureOTPManager {
     const formatType = v % 10;
     v = Math.floor(v / 10);
     const digits = v;
-
-    console.log("Parsed -> Digits:", digits, "Format:", formatType, "Logic:", getType);
-
-    // Step 1: Break digitString into pairs
+  
+    // Step 1: Break digitString into 2-char pairs
     const pairs = [];
     for (let i = 0; i < digitString.length; i += 2) {
       pairs.push(digitString.slice(i, i + 2));
     }
-
-    // Step 2: Reduce each pair to a single digit
+  
+    // Step 2: Reduce each pair to a single digit (digit sum reduction)
     const singleDigits = pairs.map(pair => {
       let sum = parseInt(pair[0]) + parseInt(pair[1]);
       while (sum >= 10) {
@@ -66,10 +64,10 @@ class SecureOTPManager {
       }
       return sum;
     });
-
-    // Step 3: Apply transformation logic
+  
+    // Step 3: Transformation logic (getType)
     let transformedDigits = [];
-
+  
     switch (getType) {
       case 0: {
         let reversed = singleDigits.slice().reverse();
@@ -110,63 +108,69 @@ class SecureOTPManager {
         });
       }
     }
-
-    // Step 4: Final digit-only OTP (trim or pad to exact 'digits' length)
-    let digitOtp = transformedDigits.join('').slice(0, digits);
-    if (digitOtp.length < digits) {
-      // pad with repeating digits (from beginning)
-      const pad = digitOtp.padEnd(digits, digitOtp[0]);
-      digitOtp = pad.slice(0, digits);
+  
+    // Step 4: Create digitOtp and apply Flutter-style digit length logic
+    let digitOtp = transformedDigits.join('');
+  
+    // Flutter-style digit adjustment
+    if (digits === 4) {
+      digitOtp = digitOtp.slice(0, -1);
+    } else if (digits === 6) {
+      const last = parseInt(digitOtp[digitOtp.length - 1]);
+      digitOtp += (last >> 1).toString();
+    } else if (digits === 7) {
+      const last = parseInt(digitOtp[digitOtp.length - 1]);
+      const s1 = last >> 1;
+      const s2 = s1 >> 1;
+      digitOtp += s1.toString() + s2.toString();
     }
-
-    // Step 5: Apply format type — ensure 1-to-1 mapping per digit
+  
+    // Truncate to correct length: base digits + any appended shift
+    digitOtp = digitOtp.slice(0, digits + (digits === 6 ? 1 : 0) + (digits === 7 ? 2 : 0));
+  
+    // Step 5: Apply format type
     let finalOtp = '';
-
+  
     if (formatType === 0) {
       finalOtp = digitOtp;
     } else if (formatType === 1) {
-      // Alphabetic: 0 → A, 1 → B, ..., 9 → J
       finalOtp = digitOtp.split('').map(d => String.fromCharCode('A'.charCodeAt(0) + parseInt(d))).join('');
     } else if (formatType === 2) {
-      // Type 2 → Alphanumeric: Digit + Letter of Next Digit
       const chars = digitOtp.split('');
       let formatted = '';
       for (let i = 0; i < chars.length; i += 2) {
-        formatted += chars[i]; // Keep digit
+        formatted += chars[i]; // digit
         if (i + 1 < chars.length) {
           const nextDigit = parseInt(chars[i + 1]);
-          const letter = String.fromCharCode('A'.charCodeAt(0) + nextDigit);
-          formatted += letter;
+          formatted += String.fromCharCode('A'.charCodeAt(0) + nextDigit);
         }
       }
       finalOtp = formatted;
     } else if (formatType === 3) {
-      // Type 3 → Complex: Digit + Letter + Special Symbol (3-char pattern)
       const specialChars = ['!', '@', '#', '$', '%', '^', '&', '*', '(', ')'];
       const chars = digitOtp.split('');
       let formatted = '';
-
       for (let i = 0; i < chars.length; i += 3) {
-        if (i < chars.length) {
-          formatted += chars[i]; // digit
-        }
+        if (i < chars.length) formatted += chars[i]; // digit
         if (i + 1 < chars.length) {
           const d = parseInt(chars[i + 1]);
           formatted += String.fromCharCode('A'.charCodeAt(0) + d); // letter
         }
         if (i + 2 < chars.length) {
           const d = parseInt(chars[i + 2]);
-          formatted += specialChars[d]; // symbol
+          formatted += specialChars[d]; // special char
         }
       }
-
       finalOtp = formatted;
     }
-
-    console.log("Final OTP:", finalOtp);
+  
+    // Optional tracking
     this.otpData = finalOtp;
     this.generatedAt = new Date();
     this.attempts = 0;
+
+    console.log("Final OTP:",finalOtp);
+  
     return finalOtp;
   }
 
@@ -286,7 +290,7 @@ const validateRegistration = (req, res, next) => {
   }
   
   // OTP type validation
-  const validOtpTypes = ['alphabets', 'numeric', 'alphanumeric', 'complex'];
+  const validOtpTypes = ['alphabets', 'numeric', 'alphanumeric', 'complex', 'random_rotation'];
   if (otpType && !validOtpTypes.includes(otpType)) {
     return res.status(400).json({
       success: false,
@@ -325,16 +329,19 @@ app.post('/api/register', validateRegistration, async (req, res) => {
         message: 'User with this phone number or email already exists'
       });
     }
+
+    const rotationEnabled = otpType === 'random_rotation';
+    const actualOtpType = rotationEnabled ? 'numeric' : otpType; 
     
     // Generate secret key
     const secretKey = generateSecretKey(phoneNumber);
     
     // Insert new user with OTP settings
     const result = await pool.query(
-      `INSERT INTO users (full_name, phone_number, email, secret_key, otp_request_limit, otp_requests_used, otp_digits, otp_type) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) 
-       RETURNING id, full_name, phone_number, email, secret_key, otp_request_limit, otp_digits, otp_type, created_at`,
-      [fullName, phoneNumber, email, secretKey, 10, 0, parseInt(otpDigits), otpType]
+      `INSERT INTO users (full_name, phone_number, email, secret_key, otp_request_limit, otp_requests_used, otp_digits, otp_type, rotation_enabled, current_rotation_index) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) 
+       RETURNING id, full_name, phone_number, email, secret_key, otp_request_limit, otp_digits, otp_type, rotation_enabled, created_at`,
+      [fullName, phoneNumber, email, secretKey, 10, 0, parseInt(otpDigits), actualOtpType, rotationEnabled, 0]
     );
     
     const newUser = result.rows[0];
@@ -364,6 +371,23 @@ app.post('/api/register', validateRegistration, async (req, res) => {
   }
 });
 
+// Transaction logging function
+const logTransaction = async (userId, endpoint, requestData, responseData, statusCode, success, req) => {
+  try {
+    const ipAddress = req.ip || req.connection.remoteAddress || req.socket.remoteAddress;
+    const userAgent = req.get('User-Agent') || 'Unknown';
+    
+    await pool.query(
+      `INSERT INTO transactions (user_id, endpoint, request_data, response_data, status_code, success, ip_address, user_agent) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [userId, endpoint, requestData, responseData, statusCode, success, ipAddress, userAgent]
+    );
+  } catch (error) {
+    console.error('Transaction logging error:', error);
+    // Don't throw error to avoid breaking the main flow
+  }
+};
+
 // Check OTP request availability by secret key endpoint
 app.post('/api/check-otp-availability', async (req, res) => {
   const { secretKey } = req.body;
@@ -380,7 +404,7 @@ app.post('/api/check-otp-availability', async (req, res) => {
     // Get user details by secret key
     const userResult = await pool.query(
       `SELECT id, full_name, phone_number, email, otp_digits, otp_type, 
-              otp_requests_used, otp_request_limit, is_active 
+              otp_requests_used, otp_request_limit, is_active, rotation_enabled, current_rotation_index 
        FROM users 
        WHERE secret_key = $1`,
       [secretKey]
@@ -394,6 +418,7 @@ app.post('/api/check-otp-availability', async (req, res) => {
     }
     
     const user = userResult.rows[0];
+    let currentOtpType = user.otp_type;
     
     // Check if user is active
     if (!user.is_active) {
@@ -421,7 +446,29 @@ app.post('/api/check-otp-availability', async (req, res) => {
         }
       });
     }
-    
+    if (user.rotation_enabled) {
+      const rotationTypes = ['numeric', 'alphabets', 'alphanumeric', 'complex'];
+      const currentIndex = user.current_rotation_index;
+      currentOtpType = rotationTypes[currentIndex];
+      
+      // Calculate next rotation index
+      const nextIndex = (currentIndex + 1) % rotationTypes.length;
+      
+      // Update rotation index for next time
+      await pool.query(
+        'UPDATE users SET current_rotation_index = $1 WHERE id = $2',
+        [nextIndex, user.id]
+      );
+    }
+    await logTransaction(
+      user.id, 
+      'check-otp-availability', 
+      { secretKey: secretKey.substring(0, 8) + '...' }, // Partial secret for security
+      { canGenerateOTP: true, remainingRequests }, 
+      200, 
+      true, 
+      req
+    );
     // Requests available - return OTP type details
     res.json({
       success: true,
@@ -431,17 +478,27 @@ app.post('/api/check-otp-availability', async (req, res) => {
         fullName: user.full_name,
         phoneNumber: user.phone_number,
         email: user.email,
-        otpType: user.otp_type,
+        otpType: currentOtpType, // Use the rotated type
         otpDigits: user.otp_digits,
         otpRequestsUsed: user.otp_requests_used,
         otpRequestLimit: user.otp_request_limit,
         remainingRequests: remainingRequests,
-        canGenerateOTP: true
+        canGenerateOTP: true,
+        rotationEnabled: user.rotation_enabled
       }
     });
     
-  } catch (error) {
+  }  catch (error) {
     console.error('OTP availability check error:', error);
+    await logTransaction(
+      null, 
+      'check-otp-availability', 
+      { secretKey: secretKey ? secretKey.substring(0, 8) + '...' : null }, 
+      { error: error.message }, 
+      500, 
+      false, 
+      req
+    );
     res.status(500).json({
       success: false,
       message: 'Internal server error during OTP availability check'
@@ -465,7 +522,7 @@ app.post('/api/generate-otp', async (req, res) => {
     // Get user details by secret key
     const userResult = await pool.query(
       `SELECT id, full_name, phone_number, email, otp_digits, otp_type, 
-              otp_requests_used, otp_request_limit, is_active 
+              otp_requests_used, otp_request_limit, is_active, rotation_enabled, current_rotation_index 
        FROM users 
        WHERE secret_key = $1`,
       [secretKey]
@@ -479,6 +536,23 @@ app.post('/api/generate-otp', async (req, res) => {
     }
     
     const user = userResult.rows[0];
+    let currentOtpType = user.otp_type;
+    
+    // Use the same rotation logic as check-availability
+    if (user.rotation_enabled) {
+      const rotationTypes = ['numeric', 'alphabets', 'alphanumeric', 'complex'];
+      const currentIndex = user.current_rotation_index;
+      currentOtpType = rotationTypes[currentIndex];
+      
+      // Calculate next rotation index for next time
+      const nextIndex = (currentIndex + 1) % rotationTypes.length;
+      
+      // Update rotation index for next OTP generation
+      await pool.query(
+        'UPDATE users SET current_rotation_index = $1 WHERE id = $2',
+        [nextIndex, user.id]
+      );
+    }
     
     // Check if user is active
     if (!user.is_active) {
@@ -497,15 +571,14 @@ app.post('/api/generate-otp', async (req, res) => {
         message: 'OTP request limit has been exhausted. Please contact support.'
       });
     }
-    
-    // Generate the type configuration based on your logic
-    const type = user.otp_type;
+
+    // Generate the type configuration based on currentOtpType (rotated type)
     const digits = user.otp_digits;
     let formatCode = 0;
 
-    if (type === 'numeric') formatCode = 1;
-    else if (type === 'alphanumeric') formatCode = 2;
-    else if (type === 'complex') formatCode = 3;
+    if (currentOtpType === 'alphabets') formatCode = 1;
+    else if (currentOtpType === 'alphanumeric') formatCode = 2;
+    else if (currentOtpType === 'complex') formatCode = 3;
 
     const logicCode = Math.floor(Math.random() * 5);
     const finalType = digits * 100 + formatCode * 10 + logicCode;
@@ -533,14 +606,30 @@ app.post('/api/generate-otp', async (req, res) => {
     
     // Store OTP session (you might want to store this in database for production)
     // For now, we'll just return the data
+
+    await logTransaction(
+      user.id, 
+      'generate-otp', 
+      { phoneNumber, secretKey: secretKey.substring(0, 8) + '...' }, 
+      { 
+        otpGenerated: true, 
+        otpType: currentOtpType, 
+        otpDigits: user.otp_digits,
+        remainingRequests: remainingRequests - 1 
+      }, 
+      200, 
+      true, 
+      req
+    );
     
     res.json({
       success: true,
       message: 'OTP generated successfully',
       data: {
         otp: generatedOTP,
-        otpType: user.otp_type,
+        otpType: currentOtpType, // Use the rotated type
         otpDigits: user.otp_digits,
+        phoneNumber: phoneNumber,
         qrData: {
           transformedDigits: qrData.transformedDigits,
           alphabetData: qrData.alphabetData
@@ -556,6 +645,15 @@ app.post('/api/generate-otp', async (req, res) => {
     
   } catch (error) {
     console.error('OTP generation error:', error);
+    await logTransaction(
+      null, 
+      'generate-otp', 
+      { phoneNumber, secretKey: secretKey ? secretKey.substring(0, 8) + '...' : null }, 
+      { error: error.message }, 
+      500, 
+      false, 
+      req
+    );
     res.status(500).json({
       success: false,
       message: 'Internal server error during OTP generation'
