@@ -3,14 +3,180 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const { Pool } = require('pg');
+const { exec } = require('child_process');
+const util = require('util');
 require('dotenv').config();
+
+const execAsync = util.promisify(exec);
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Allowed MAC addresses (whitelist)
+const ALLOWED_MAC_ADDRESSES = [
+  '10:A5:1D:7F:65:75',//Shajith
+  '2C:33:58:89:76:05',//Raj
+  'AA:71:BB:B4:25:66',//Babloo
+  'C8:94:02:47:1E:65',//Allwin
+  "92:35:61:70:4f:99",//Akash
+  "28:c5:d2:2c:bb:f4",//Prgathy
+  "d0:39:57:01:14:a7",//Manoj
+  "dc:21:5c:da:b6:e6",//Varnasri
+  '00:11:22:33:44:55',
+  'aa:bb:cc:dd:ee:ff',
+  '12:34:56:78:90:ab'
+];
+
+// Cross-platform MAC address retrieval function
+const getMACAddress = async (ip) => {
+  const cleanIP = ip.replace('::ffff:', '');
+  let clientMAC = null;
+  
+  // Detect operating system
+  const isWindows = process.platform === 'win32';
+  const isLinux = process.platform === 'linux';
+  const isMac = process.platform === 'darwin';
+  
+  try {
+    if (isWindows) {
+      // Windows commands
+      try {
+        // First try to ping to populate ARP table
+        await execAsync(`ping -n 1 -w 1000 ${cleanIP} >nul 2>&1`);
+        
+        // Get ARP table on Windows
+        const { stdout } = await execAsync(`arp -a ${cleanIP}`);
+        const macMatch = stdout.match(/([0-9a-fA-F]{2}[-]){5}[0-9a-fA-F]{2}/i);
+        if (macMatch) {
+          clientMAC = macMatch[0].replace(/-/g, ':').toLowerCase();
+        }
+      } catch (error) {
+        console.log('Windows ARP lookup failed:', error.message);
+        
+        // Alternative Windows method using netsh
+        try {
+          const { stdout } = await execAsync(`netsh interface ip show neighbors | findstr ${cleanIP}`);
+          const macMatch = stdout.match(/([0-9a-fA-F]{2}[-]){5}[0-9a-fA-F]{2}/i);
+          if (macMatch) {
+            clientMAC = macMatch[0].replace(/-/g, ':').toLowerCase();
+          }
+        } catch (altError) {
+          console.log('Alternative Windows method failed:', altError.message);
+        }
+      }
+    } else if (isLinux || isMac) {
+      // Linux/Mac commands
+      try {
+        // Try ping first to populate ARP table
+        const pingCmd = isMac ? `ping -c 1 -W 1000 ${cleanIP}` : `ping -c 1 -W 1 ${cleanIP}`;
+        await execAsync(`${pingCmd} > /dev/null 2>&1`);
+        
+        // Get ARP table
+        const { stdout } = await execAsync(`arp -n ${cleanIP}`);
+        const arpLines = stdout.split('\n');
+        
+        for (const line of arpLines) {
+          if (line.includes(cleanIP)) {
+            const parts = line.split(/\s+/);
+            const macMatch = parts.find(part => /^([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$/.test(part));
+            if (macMatch) {
+              clientMAC = macMatch.toLowerCase();
+              break;
+            }
+          }
+        }
+      } catch (error) {
+        console.log('Unix ARP lookup failed:', error.message);
+        
+        // Alternative method for Unix systems
+        try {
+          const { stdout } = await execAsync(`arp -a | grep ${cleanIP}`);
+          const macMatch = stdout.match(/([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}/i);
+          if (macMatch) {
+            clientMAC = macMatch[0].toLowerCase();
+          }
+        } catch (altError) {
+          console.log('Alternative Unix method failed:', altError.message);
+        }
+      }
+    }
+  } catch (error) {
+    console.log('MAC address retrieval failed:', error.message);
+  }
+  
+  return clientMAC;
+};
+
+// Simple MAC address firewall middleware
+const macAddressFirewall = async (req, res, next) => {
+  try {
+    const clientIP = req.ip || req.connection.remoteAddress || req.socket.remoteAddress;
+    const cleanIP = clientIP.replace('::ffff:', '');
+    
+    // Skip firewall for health check and debug endpoints from localhost
+    if(clientIP === '127.0.0.1')
+        return next();
+    if ((req.path === '/api/health' || req.path === '/api/debug/network-info' || req.path === '/api/admin/temp-allow-ip') && 
+        (clientIP === '127.0.0.1' || clientIP === '::1' || clientIP === '::ffff:127.0.0.1')) {
+      return next();
+    }
+    
+    // Check for temporarily allowed IPs
+    if (global.tempAllowedIPs && global.tempAllowedIPs.has(cleanIP)) {
+      const expiryTime = global.tempAllowedIPs.get(cleanIP);
+      if (Date.now() < expiryTime) {
+        console.log(`✅ Temporary access granted for IP: ${clientIP}`);
+        return next();
+      } else {
+        // Remove expired entry
+        global.tempAllowedIPs.delete(cleanIP);
+        console.log(`⏰ Temporary access expired for IP: ${clientIP}`);
+      }
+    }
+    
+    // Get MAC address using cross-platform method
+    const clientMAC = await getMACAddress(clientIP);
+    
+    console.log(`Request from IP: ${clientIP}, MAC: ${clientMAC || 'Unknown'}`);
+    
+    // Check if MAC address is in allowed list
+    if (clientMAC && ALLOWED_MAC_ADDRESSES.map(mac => mac.toLowerCase()).includes(clientMAC)) {
+      console.log(`✅ Access granted for MAC: ${clientMAC}`);
+      return next();
+    }
+    
+    // Block request if MAC is not allowed or couldn't be determined
+    console.log(`❌ Access denied for IP: ${clientIP}, MAC: ${clientMAC || 'Unknown'}`);
+    
+    return res.status(403).json({
+      success: false,
+      message: 'Access denied: Device not authorized',
+      code: 'MAC_ADDRESS_NOT_ALLOWED',
+      debug: {
+        clientIP: clientIP,
+        detectedMAC: clientMAC,
+        platform: process.platform,
+        hint: 'Use /api/debug/network-info from localhost to find your MAC address'
+      }
+    });
+    
+  } catch (error) {
+    console.error('MAC firewall error:', error);
+    // In case of firewall error, deny access for security
+    return res.status(500).json({
+      success: false,
+      message: 'Security check failed',
+      code: 'FIREWALL_ERROR'
+    });
+  }
+};
+
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// Apply MAC address firewall to all routes
+app.use(macAddressFirewall);
 
 // PostgreSQL connection
 const pool = new Pool({
@@ -301,9 +467,118 @@ const validateRegistration = (req, res, next) => {
   next();
 };
 
+// Debug endpoint to help identify MAC addresses (bypasses firewall)
+app.get('/api/debug/network-info', async (req, res) => {
+  try {
+    const clientIP = req.ip || req.connection.remoteAddress || req.socket.remoteAddress;
+    const cleanIP = clientIP.replace('::ffff:', '');
+    
+    // Get MAC address
+    const clientMAC = await getMACAddress(clientIP);
+    
+    // Get full ARP table for debugging
+    let arpTable = [];
+    const isWindows = process.platform === 'win32';
+    
+    try {
+      let stdout;
+      if (isWindows) {
+        const result = await execAsync('arp -a');
+        stdout = result.stdout;
+      } else {
+        const result = await execAsync('arp -a');
+        stdout = result.stdout;
+      }
+      
+      // Parse ARP table
+      const lines = stdout.split('\n');
+      for (const line of lines) {
+        const macMatch = line.match(/([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}/i);
+        const ipMatch = line.match(/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/);
+        
+        if (macMatch && ipMatch) {
+          arpTable.push({
+            ip: ipMatch[0],
+            mac: macMatch[0].replace(/-/g, ':').toLowerCase()
+          });
+        }
+      }
+    } catch (error) {
+      console.log('Could not retrieve ARP table:', error.message);
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        clientIP: clientIP,
+        cleanIP: cleanIP,
+        detectedMAC: clientMAC,
+        platform: process.platform,
+        isAllowed: clientMAC ? ALLOWED_MAC_ADDRESSES.map(mac => mac.toLowerCase()).includes(clientMAC) : false,
+        allowedMACs: ALLOWED_MAC_ADDRESSES,
+        arpTable: arpTable.slice(0, 10), // Limit to first 10 entries
+        timestamp: new Date().toISOString()
+      }
+    });
+    
+  } catch (error) {
+    console.error('Network debug error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to retrieve network information',
+      error: error.message
+    });
+  }
+});
+
+// Endpoint to temporarily allow an IP address (for initial setup)
+app.post('/api/admin/temp-allow-ip', (req, res) => {
+  const { ipAddress, duration = 300 } = req.body; // Default 5 minutes
+  
+  if (!ipAddress) {
+    return res.status(400).json({
+      success: false,
+      message: 'IP address is required'
+    });
+  }
+  
+  // Store temporarily allowed IPs (in production, use Redis or database)
+  if (!global.tempAllowedIPs) {
+    global.tempAllowedIPs = new Map();
+  }
+  
+  const expiryTime = Date.now() + (duration * 1000);
+  global.tempAllowedIPs.set(ipAddress, expiryTime);
+  
+  // Clean up expired entries
+  setTimeout(() => {
+    if (global.tempAllowedIPs.has(ipAddress)) {
+      global.tempAllowedIPs.delete(ipAddress);
+      console.log(`Temporary access removed for IP: ${ipAddress}`);
+    }
+  }, duration * 1000);
+  
+  console.log(`Temporary access granted to IP: ${ipAddress} for ${duration} seconds`);
+  
+  res.json({
+    success: true,
+    message: `Temporary access granted for ${duration} seconds`,
+    data: {
+      ipAddress: ipAddress,
+      expiresAt: new Date(expiryTime).toISOString(),
+      duration: duration
+    }
+  });
+});
+
 // Routes
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'OK', message: 'OTP Authenticator API is running' });
+  res.json({ 
+    status: 'OK', 
+    message: 'OTP Authenticator API with MAC firewall is running',
+    platform: process.platform,
+    timestamp: new Date().toISOString()
+  });
 });
 
 // User registration endpoint
@@ -784,12 +1059,12 @@ app.put('/api/user/:userId/otp-settings', async (req, res) => {
     let paramIndex = 1;
     
     if (otpDigits !== undefined) {
-      updateFields.push(`otp_digits = $${paramIndex++}`);
+      updateFields.push(`otp_digits = ${paramIndex++}`);
       values.push(parseInt(otpDigits));
     }
     
     if (otpType !== undefined) {
-      updateFields.push(`otp_type = $${paramIndex++}`);
+      updateFields.push(`otp_type = ${paramIndex++}`);
       values.push(otpType);
     }
     
@@ -803,7 +1078,7 @@ app.put('/api/user/:userId/otp-settings', async (req, res) => {
     values.push(userId);
     
     const result = await pool.query(
-      `UPDATE users SET ${updateFields.join(', ')} WHERE id = $${paramIndex} RETURNING otp_digits, otp_type`,
+      `UPDATE users SET ${updateFields.join(', ')} WHERE id = ${paramIndex} RETURNING otp_digits, otp_type`,
       values
     );
     
@@ -832,6 +1107,89 @@ app.put('/api/user/:userId/otp-settings', async (req, res) => {
   }
 });
 
+// MAC address management endpoints
+app.get('/api/admin/allowed-macs', (req, res) => {
+  res.json({
+    success: true,
+    data: {
+      allowedMacs: ALLOWED_MAC_ADDRESSES,
+      count: ALLOWED_MAC_ADDRESSES.length
+    }
+  });
+});
+
+app.post('/api/admin/add-mac', (req, res) => {
+  const { macAddress } = req.body;
+  
+  if (!macAddress) {
+    return res.status(400).json({
+      success: false,
+      message: 'MAC address is required'
+    });
+  }
+  
+  // Validate MAC address format
+  const macRegex = /^([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$/;
+  if (!macRegex.test(macAddress)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid MAC address format. Use format: xx:xx:xx:xx:xx:xx'
+    });
+  }
+  
+  const normalizedMac = macAddress.toLowerCase();
+  
+  if (ALLOWED_MAC_ADDRESSES.map(mac => mac.toLowerCase()).includes(normalizedMac)) {
+    return res.status(409).json({
+      success: false,
+      message: 'MAC address already exists in allowed list'
+    });
+  }
+  
+  ALLOWED_MAC_ADDRESSES.push(normalizedMac);
+  
+  res.json({
+    success: true,
+    message: 'MAC address added successfully',
+    data: {
+      addedMac: normalizedMac,
+      allowedMacs: ALLOWED_MAC_ADDRESSES
+    }
+  });
+});
+
+app.delete('/api/admin/remove-mac', (req, res) => {
+  const { macAddress } = req.body;
+  
+  if (!macAddress) {
+    return res.status(400).json({
+      success: false,
+      message: 'MAC address is required'
+    });
+  }
+  
+  const normalizedMac = macAddress.toLowerCase();
+  const index = ALLOWED_MAC_ADDRESSES.map(mac => mac.toLowerCase()).indexOf(normalizedMac);
+  
+  if (index === -1) {
+    return res.status(404).json({
+      success: false,
+      message: 'MAC address not found in allowed list'
+    });
+  }
+  
+  ALLOWED_MAC_ADDRESSES.splice(index, 1);
+  
+  res.json({
+    success: true,
+    message: 'MAC address removed successfully',
+    data: {
+      removedMac: normalizedMac,
+      allowedMacs: ALLOWED_MAC_ADDRESSES
+    }
+  });
+});
+
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);
@@ -851,14 +1209,31 @@ app.use('*', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`Available endpoints:`);
+  console.log(`MAC Address Firewall Active - Platform: ${process.platform}`);
+  console.log(`Allowed MAC Addresses (${ALLOWED_MAC_ADDRESSES.length}):`);
+  ALLOWED_MAC_ADDRESSES.forEach((mac, index) => {
+    console.log(`  ${index + 1}. ${mac}`);
+  });
+  
+  console.log(`\n🔧 Setup Help:`);
+  console.log(`1. Visit http://localhost:${PORT}/api/debug/network-info to find your MAC address`);
+  console.log(`2. Add your MAC address to ALLOWED_MAC_ADDRESSES array`);
+  console.log(`3. Or use temporary access: POST /api/admin/temp-allow-ip with your IP`);
+  
+  console.log(`\n📋 Available endpoints:`);
   console.log(`- GET /api/health`);
+  console.log(`- GET /api/debug/network-info (localhost only)`);
+  console.log(`- POST /api/admin/temp-allow-ip (localhost only)`);
   console.log(`- POST /api/register`);
   console.log(`- POST /api/check-otp-availability`);
   console.log(`- POST /api/generate-otp`);
   console.log(`- POST /api/verify-otp`);
   console.log(`- GET /api/user/:phoneNumber`);
   console.log(`- PUT /api/user/:userId/otp-settings`);
+  console.log(`\n🛡️ MAC Management endpoints:`);
+  console.log(`- GET /api/admin/allowed-macs`);
+  console.log(`- POST /api/admin/add-mac`);
+  console.log(`- DELETE /api/admin/remove-mac`);
 });
 
 module.exports = app;
