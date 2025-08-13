@@ -16,15 +16,26 @@ const PORT = process.env.PORT || 3001;
 const ALLOWED_MAC_ADDRESSES = [
   '10:A5:1D:7F:65:75',//Shajith
   '2C:33:58:89:76:05',//Raj
-  'AA:71:BB:B4:25:66',//Babloo
+  'de:a1:79:ad:84:a8',//Babloo
+  '3e:64:40:b5:1a:f8',//babloo2
   'C8:94:02:47:1E:65',//Allwin
   "92:35:61:70:4f:99",//Akash
   "28:c5:d2:2c:bb:f4",//Prgathy
   "d0:39:57:01:14:a7",//Manoj
   "dc:21:5c:da:b6:e6",//Varnasri
+  "b4:8c:9d:2d:9a:6f",//Tarun
+  "f2:ba:ab:59:52:14",//Akash2
+  "14:13:33:72:f2:9f",//prasanna
+  "4e:9a:c3:95:ce:38",//babloo lok
   '00:11:22:33:44:55',
   'aa:bb:cc:dd:ee:ff',
-  '12:34:56:78:90:ab'
+  '12:34:56:78:90:ab',
+ '76:18:f4:5a:28:11' ,
+ "50:c2:e8:17:9a:63",
+ "cc:6b:1e:59:05:fd",
+ "ee:14:fd:79:f6:a8",
+ "c8:94:02:48:3b:af"
+
 ];
 
 // Cross-platform MAC address retrieval function
