@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const { Pool } = require('pg');
 const { exec } = require('child_process');
 const util = require('util');
+const fs = require("fs");
 require('dotenv').config();
 
 const execAsync = util.promisify(exec);
@@ -12,20 +13,51 @@ const execAsync = util.promisify(exec);
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+
+function getAllowedMacs() {
+    const keyHex = process.env.SECRET_KEY || "";
+    const ivHex = process.env.IV || "";
+
+    if (keyHex.length !== 64) {
+        throw new Error(`SECRET_KEY is invalid length: got ${keyHex.length} chars, expected 64`);
+    }
+    if (ivHex.length !== 32) {
+        throw new Error(`IV is invalid length: got ${ivHex.length} chars, expected 32`);
+    }
+
+    const SECRET_KEY = Buffer.from(keyHex, "hex");
+    const IV = Buffer.from(ivHex, "hex");
+
+    const encryptedData = fs.readFileSync("allowedMacs.enc", "utf8");
+
+    const decipher = crypto.createDecipheriv("aes-256-cbc", SECRET_KEY, IV);
+    let decrypted = decipher.update(encryptedData, "hex", "utf8");
+    decrypted += decipher.final("utf8");
+
+    return JSON.parse(decrypted);
+}
+
 // Allowed MAC addresses (whitelist)
-const ALLOWED_MAC_ADDRESSES = [
-  '10:A5:1D:7F:65:75',//Shajith
-  '2C:33:58:89:76:05',//Raj
-  'AA:71:BB:B4:25:66',//Babloo
-  'C8:94:02:47:1E:65',//Allwin
-  "92:35:61:70:4f:99",//Akash
-  "28:c5:d2:2c:bb:f4",//Prgathy
-  "d0:39:57:01:14:a7",//Manoj
-  "dc:21:5c:da:b6:e6",//Varnasri
-  '00:11:22:33:44:55',
-  'aa:bb:cc:dd:ee:ff',
-  '12:34:56:78:90:ab'
-];
+// const ALLOWED_MAC_ADDRESSES = [
+//   '10:A5:1D:7F:65:75',//Shajith
+//   '2C:33:58:89:76:05',//Raj
+//   'AA:71:BB:B4:25:66',//Babloo
+//   'C8:94:02:47:1E:65',//Allwin
+//   "92:35:61:70:4f:99",//Akash
+//   "28:c5:d2:2c:bb:f4",//Pragathy
+//   "d0:39:57:01:14:a7",//Manoj
+//   "dc:21:5c:da:b6:e6",//Varnasri,
+//   "b4:8c:9d:2d:9a:6f",//Tarun
+//   "f2:ba:ab:59:52:14",//Akash2
+//   "14:13:33:72:f2:9f"//Prassana
+//   "50:C2:E8:17:9A:63" //megha
+//   '00:11:22:33:44:55',
+//   'aa:bb:cc:dd:ee:ff',
+//   '12:34:56:78:90:ab',
+// ];
+
+const ALLOWED_MAC_ADDRESSES = getAllowedMacs();
+// console.log(ALLOWED_MAC_ADDRESSES);
 
 // Cross-platform MAC address retrieval function
 const getMACAddress = async (ip) => {
