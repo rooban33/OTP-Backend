@@ -7,7 +7,7 @@ const { exec } = require('child_process');
 const util = require('util');
 const fs = require("fs");
 require('dotenv').config();
-
+const { concurrencyMiddleware, getConcurrencyStatus } = require('./concurrency-manager');
 const execAsync = util.promisify(exec);
 
 const app = express();
@@ -74,7 +74,10 @@ const getMACAddress = async (ip) => {
       // Windows commands
       try {
         // First try to ping to populate ARP table
-        await execAsync(`ping -n 1 -w 1000 ${cleanIP} >nul 2>&1`);
+        try {
+          await execAsync(`ping -n 1 -w 1000 ${cleanIP}`);
+        } catch (pingError) {
+        }
         
         // Get ARP table on Windows
         const { stdout } = await execAsync(`arp -a ${cleanIP}`);
@@ -139,62 +142,104 @@ const getMACAddress = async (ip) => {
   return clientMAC;
 };
 
+// Simple MAC check cache (queue of max 4 entries)
+const macCache = [];
+
+// Helper to get cached result
+function getCacheResult(mac) {
+  const entry = macCache.find(e => e.mac === mac);
+  return entry ? entry.allowed : null;
+}
+
+// Helper to add to cache
+function addToCache(mac, allowed) {
+  // If MAC already exists, update its value & move to end
+  const index = macCache.findIndex(e => e.mac === mac);
+  if (index !== -1) {
+    macCache.splice(index, 1);
+  }
+  macCache.push({ mac, allowed });
+
+  // Keep only last 4 entries
+  if (macCache.length > 4) {
+    macCache.shift();
+  }
+}
+
 // Simple MAC address firewall middleware
 const macAddressFirewall = async (req, res, next) => {
   try {
     const clientIP = req.ip || req.connection.remoteAddress || req.socket.remoteAddress;
     const cleanIP = clientIP.replace('::ffff:', '');
-    
-    // Skip firewall for health check and debug endpoints from localhost
-    if(clientIP === '127.0.0.1')
-        return next();
-    if ((req.path === '/api/health' || req.path === '/api/debug/network-info' || req.path === '/api/admin/temp-allow-ip') && 
-        (clientIP === '127.0.0.1' || clientIP === '::1' || clientIP === '::ffff:127.0.0.1')) {
+
+    // Skip firewall for certain cases
+    if (clientIP === '192.168.160.245' || clientIP === '127.0.0.1')
+      return next();
+    if (
+      (req.path === '/api/health' ||
+       req.path === '/api/debug/network-info' ||
+       req.path === '/api/admin/temp-allow-ip') &&
+      (clientIP === '127.0.0.1' || clientIP === '::1' || clientIP === '::ffff:127.0.0.1')
+    ) {
       return next();
     }
-    
-    // Check for temporarily allowed IPs
+
+    // Temporary allowed IPs
     if (global.tempAllowedIPs && global.tempAllowedIPs.has(cleanIP)) {
       const expiryTime = global.tempAllowedIPs.get(cleanIP);
       if (Date.now() < expiryTime) {
         console.log(`✅ Temporary access granted for IP: ${clientIP}`);
         return next();
       } else {
-        // Remove expired entry
         global.tempAllowedIPs.delete(cleanIP);
         console.log(`⏰ Temporary access expired for IP: ${clientIP}`);
       }
     }
-    
-    // Get MAC address using cross-platform method
+
+    // Get MAC
     const clientMAC = await getMACAddress(clientIP);
-    
     console.log(`Request from IP: ${clientIP}, MAC: ${clientMAC || 'Unknown'}`);
-    
-    // Check if MAC address is in allowed list
-    if (clientMAC && ALLOWED_MAC_ADDRESSES.map(mac => mac.toLowerCase()).includes(clientMAC)) {
+
+    if (!clientMAC) {
+      console.log(`❌ Access denied for IP: ${clientIP}, MAC unknown`);
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied: Device not authorized',
+        code: 'MAC_ADDRESS_NOT_ALLOWED'
+      });
+    }
+
+    // Check cache first
+    // const cachedAllowed = getCacheResult(clientMAC.toLowerCase());
+    // if (cachedAllowed !== null) {
+    //   console.log(`🔄 Cache hit for MAC: ${clientMAC} → ${cachedAllowed ? 'Allowed' : 'Denied'}`);
+    //   return cachedAllowed ? next() : res.status(403).json({
+    //     success: false,
+    //     message: 'Access denied: Device not authorized (cache)',
+    //     code: 'MAC_ADDRESS_NOT_ALLOWED'
+    //   });
+    // }
+
+    // Normal check
+    const isAllowed = ALLOWED_MAC_ADDRESSES.map(mac => mac.toLowerCase()).includes(clientMAC.toLowerCase());
+
+    // Add to cache
+    addToCache(clientMAC.toLowerCase(), isAllowed);
+
+    if (isAllowed) {
       console.log(`✅ Access granted for MAC: ${clientMAC}`);
       return next();
     }
-    
-    // Block request if MAC is not allowed or couldn't be determined
-    console.log(`❌ Access denied for IP: ${clientIP}, MAC: ${clientMAC || 'Unknown'}`);
-    
+
+    console.log(`❌ Access denied for IP: ${clientIP}, MAC: ${clientMAC}`);
     return res.status(403).json({
       success: false,
       message: 'Access denied: Device not authorized',
-      code: 'MAC_ADDRESS_NOT_ALLOWED',
-      debug: {
-        clientIP: clientIP,
-        detectedMAC: clientMAC,
-        platform: process.platform,
-        hint: 'Use /api/debug/network-info from localhost to find your MAC address'
-      }
+      code: 'MAC_ADDRESS_NOT_ALLOWED'
     });
-    
+
   } catch (error) {
     console.error('MAC firewall error:', error);
-    // In case of firewall error, deny access for security
     return res.status(500).json({
       success: false,
       message: 'Security check failed',
@@ -206,9 +251,13 @@ const macAddressFirewall = async (req, res, next) => {
 // Middleware
 app.use(cors());
 app.use(express.json());
+const router = express.Router();
 
 // Apply MAC address firewall to all routes
 app.use(macAddressFirewall);
+app.use(concurrencyMiddleware);
+app.use('/api', router);
+app.get('/api/admin/concurrency-status', getConcurrencyStatus);
 
 // PostgreSQL connection
 const pool = new Pool({
@@ -227,6 +276,70 @@ pool.connect((err) => {
     console.log('Connected to PostgreSQL database');
   }
 });
+
+app.post("/api/update-mac", (req, res) => {
+  const { mac, action } = req.body;
+  console.log("mac hitted:",mac);
+  if (!mac || !["add", "remove"].includes(action)) {
+    return res.status(400).json({ success: false, message: "Invalid MAC or action" });
+  }
+
+  const path = require("path");
+  const { exec } = require("child_process");
+
+  const macFilePath = path.join(__dirname,"allowedMacs.json");
+  const encryptScript = path.join(__dirname,"encryptMacs.js");
+
+  let macs = JSON.parse(fs.readFileSync(macFilePath, "utf8"));
+
+  if (action === "add") {
+    if (!macs.includes(mac)) macs.push(mac.toUpperCase());
+  } else if (action === "remove") {
+    macs = macs.filter((m) => m !== mac);
+  }
+
+  fs.writeFileSync(macFilePath, JSON.stringify(macs, null, 2));
+
+  exec(`node "${encryptScript}"`, (err, stdout, stderr) => {
+    if (err) {
+      console.error("Encryption error:", stderr);
+      return res.status(500).json({ success: false, message: "File updated but encryption failed" });
+    }
+    console.log(stdout);
+    res.json({ success: true, message: `MAC ${action}ed successfully` });
+  });
+});
+
+
+
+router.get('/transactions/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { limit = 50 } = req.query;
+
+    const { rows } = await pool.query(
+      `SELECT * FROM transactions 
+       WHERE user_id = $1 
+       ORDER BY created_at DESC 
+       LIMIT $2`,
+      [userId, parseInt(limit)]
+    );
+
+    res.json({
+      success: true,
+      data: rows
+    });
+
+  } catch (error) {
+    console.error('Error fetching transaction logs:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch transaction logs'
+    });
+  }
+});
+
+module.exports = router;
 
 // OTP Manager Class
 class SecureOTPManager {
@@ -683,17 +796,41 @@ const logTransaction = async (userId, endpoint, requestData, responseData, statu
   try {
     const ipAddress = req.ip || req.connection.remoteAddress || req.socket.remoteAddress;
     const userAgent = req.get('User-Agent') || 'Unknown';
-    
+
+    // Assuming requestData is already an object, else parse it
+    const parsedRequest = typeof requestData === 'string' ? JSON.parse(requestData) : requestData;
+    const secretKey = parsedRequest.secretKey;
+
+    if (secretKey) {
+      // Count existing logs for this secretKey
+      const { rows } = await pool.query(
+        `SELECT id FROM transactions WHERE request_data->>'secretKey' = $1 ORDER BY id ASC`,
+        [secretKey]
+      );
+
+      if (rows.length >= 5) {
+        // Delete the oldest 5 logs for this secretKey
+        const idsToDelete = rows.slice(0, 5).map(r => r.id);
+        await pool.query(
+          `DELETE FROM transactions WHERE id = ANY($1::int[])`,
+          [idsToDelete]
+        );
+      }
+    }
+
+    // Insert the new log
     await pool.query(
       `INSERT INTO transactions (user_id, endpoint, request_data, response_data, status_code, success, ip_address, user_agent) 
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       [userId, endpoint, requestData, responseData, statusCode, success, ipAddress, userAgent]
     );
+
   } catch (error) {
     console.error('Transaction logging error:', error);
     // Don't throw error to avoid breaking the main flow
   }
 };
+
 
 // Check OTP request availability by secret key endpoint
 app.post('/api/check-otp-availability', async (req, res) => {
@@ -1067,60 +1204,68 @@ app.get('/api/user/:phoneNumber', async (req, res) => {
 app.put('/api/user/:userId/otp-settings', async (req, res) => {
   const { userId } = req.params;
   const { otpDigits, otpType } = req.body;
-  
+
   try {
-    // Validate input
-    if (otpDigits && (otpDigits < 4 || otpDigits > 7)) {
-      return res.status(400).json({
-        success: false,
-        message: 'OTP digits must be between 4 and 7'
-      });
+    // Validate OTP digits
+    if (otpDigits !== undefined) {
+      if (isNaN(otpDigits) || otpDigits < 4 || otpDigits > 7) {
+        return res.status(400).json({
+          success: false,
+          message: 'OTP digits must be a number between 4 and 7'
+        });
+      }
     }
-    
+
+    // Validate OTP type
     const validOtpTypes = ['alphabets', 'numeric', 'alphanumeric', 'complex'];
-    if (otpType && !validOtpTypes.includes(otpType)) {
+    if (otpType !== undefined && !validOtpTypes.includes(otpType)) {
       return res.status(400).json({
         success: false,
         message: 'Invalid OTP type'
       });
     }
-    
-    // Build update query dynamically
+
+    // Build the update statement dynamically
     const updateFields = [];
     const values = [];
     let paramIndex = 1;
-    
+
     if (otpDigits !== undefined) {
-      updateFields.push(`otp_digits = ${paramIndex++}`);
+      updateFields.push(`otp_digits = $${paramIndex++}`);
       values.push(parseInt(otpDigits));
     }
-    
+
     if (otpType !== undefined) {
-      updateFields.push(`otp_type = ${paramIndex++}`);
+      updateFields.push(`otp_type = $${paramIndex++}`);
       values.push(otpType);
     }
-    
+
     if (updateFields.length === 0) {
       return res.status(400).json({
         success: false,
         message: 'No valid fields to update'
       });
     }
-    
+
+    // Add userId for the WHERE clause
+    updateFields.push(`updated_at = NOW()`); // optional: track when settings changed
     values.push(userId);
-    
+
     const result = await pool.query(
-      `UPDATE users SET ${updateFields.join(', ')} WHERE id = ${paramIndex} RETURNING otp_digits, otp_type`,
+      `UPDATE users 
+       SET ${updateFields.join(', ')} 
+       WHERE id = $${paramIndex} 
+       RETURNING otp_digits, otp_type`,
       values
     );
-    
+
     if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
         message: 'User not found'
       });
     }
-    
+
     res.json({
       success: true,
       message: 'OTP settings updated successfully',
@@ -1129,7 +1274,7 @@ app.put('/api/user/:userId/otp-settings', async (req, res) => {
         otpType: result.rows[0].otp_type
       }
     });
-    
+
   } catch (error) {
     console.error('OTP settings update error:', error);
     res.status(500).json({
@@ -1138,6 +1283,7 @@ app.put('/api/user/:userId/otp-settings', async (req, res) => {
     });
   }
 });
+
 
 // MAC address management endpoints
 app.get('/api/admin/allowed-macs', (req, res) => {
